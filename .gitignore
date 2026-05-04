@@ -1,4 +1,4 @@
-*.pt
+
 *.txt
 *__pycache__*
 *.tsv
