@@ -1,11 +1,16 @@
 """
 Incremental GCN for Link Prediction.
 Adapted from DynamicGNN-main: first layer uses cached AX, second uses GCNConv.
+Now with structural regularization losses for better graph structure preservation.
 """
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.nn import GCNConv
+from loss.regulizer_loss import (
+    degree_distribution_loss, neighborhood_overlap_loss,
+    embedding_diversity_loss, degree_regularizer
+)
 
 
 class IncrementalGCNLink(nn.Module):
@@ -39,8 +44,9 @@ class IncrementalGCNLink(nn.Module):
 
 
 def train_incremental_link(model, ax, edge_index, train_pos_edge, train_neg_edge,
-                           optimizer, device='cpu'):
-    """One training step for IncrementalGCNLink."""
+                           optimizer, device='cpu', num_nodes=None,
+                           lambda_deg=0.05, lambda_nbr=0.05, lambda_div=0.02):
+    """One training step with structural regularization."""
     model.train()
     optimizer.zero_grad()
     ax = ax.to(device)
@@ -52,7 +58,19 @@ def train_incremental_link(model, ax, edge_index, train_pos_edge, train_neg_edge
     neg_label = torch.zeros(neg_score.shape[0], device=device)
     scores = torch.cat([pos_score, neg_score])
     labels = torch.cat([pos_label, neg_label])
-    loss = F.binary_cross_entropy_with_logits(scores, labels)
+    link_loss = F.binary_cross_entropy_with_logits(scores, labels)
+
+    # Structural regularization
+    n = num_nodes or z.shape[0]
+    reg_loss = torch.tensor(0.0, device=device)
+    if lambda_deg > 0:
+        reg_loss = reg_loss + lambda_deg * degree_distribution_loss(z, edge_index, n)
+    if lambda_nbr > 0:
+        reg_loss = reg_loss + lambda_nbr * neighborhood_overlap_loss(z, edge_index)
+    if lambda_div > 0:
+        reg_loss = reg_loss + lambda_div * embedding_diversity_loss(z, edge_index, n)
+
+    loss = link_loss + reg_loss
     loss.backward()
     optimizer.step()
     return loss.item()
@@ -61,7 +79,7 @@ def train_incremental_link(model, ax, edge_index, train_pos_edge, train_neg_edge
 @torch.no_grad()
 def eval_incremental_link(model, ax, edge_index, pos_edge, neg_edge, device='cpu'):
     """Evaluate IncrementalGCNLink."""
-    from sklearn.metrics import roc_auc_score, average_precision_score
+    from sklearn.metrics import roc_auc_score, average_precision_score, f1_score
     model.eval()
     ax = ax.to(device)
     edge_index = edge_index.to(device)
@@ -75,23 +93,43 @@ def eval_incremental_link(model, ax, edge_index, pos_edge, neg_edge, device='cpu
     ]).numpy()
     auc = roc_auc_score(labels, scores) if len(set(labels)) > 1 else 0.5
     ap = average_precision_score(labels, scores) if len(set(labels)) > 1 else 0.5
-    return {'auc': auc, 'ap': ap}
+    
+    pred_labels = (scores > 0.5).astype(int)
+    f1 = f1_score(labels, pred_labels) if len(set(labels)) > 1 else 0.0
+    
+    # Calculate how many of the new added edges were predicted correctly (> 0.5)
+    pos_probs = pos_score.sigmoid()
+    pos_correct = (pos_probs > 0.5).sum().item()
+    pos_total = pos_score.shape[0]
+    hit_rate = pos_correct / max(pos_total, 1)
+
+    return {
+        'auc': auc, 
+        'ap': ap, 
+        'f1': f1,
+        'pos_score': pos_probs.mean().item(),
+        'hit_rate': hit_rate
+    }
 
 
 def fine_tune_incremental(model, ax, edge_index, train_pos_edge, train_neg_edge,
-                          epochs=50, lr=5e-4, device='cpu'):
-    """Fine-tune model after incremental AX update."""
+                          epochs=50, lr=5e-4, device='cpu', num_nodes=None,
+                          lambda_deg=0.05, lambda_nbr=0.05, lambda_div=0.02):
+    """Fine-tune model after incremental AX update, with structural losses."""
     model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=5e-4)
     for _ in range(epochs):
         train_incremental_link(model, ax, edge_index, train_pos_edge, train_neg_edge,
-                               optimizer, device)
+                               optimizer, device, num_nodes,
+                               lambda_deg, lambda_nbr, lambda_div)
     return model
 
 
 def fine_tune_svd_selective(model, ax, edge_index, train_pos_edge, train_neg_edge,
-                            epochs=50, lr=5e-4, svd_k=5, svd_top_k=5, device='cpu'):
-    """Fine-tune with SVD-based row-selective gradient masking."""
+                            epochs=50, lr=5e-4, svd_k=5, svd_top_k=5, device='cpu',
+                            num_nodes=None,
+                            lambda_deg=0.05, lambda_nbr=0.05, lambda_div=0.02):
+    """Fine-tune with SVD row-selective masking + structural regularization."""
     from .incremental_utils import compute_important_rows, mask_gradients
 
     # Compute important rows before training
@@ -100,6 +138,7 @@ def fine_tune_svd_selective(model, ax, edge_index, train_pos_edge, train_neg_edg
 
     model = model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=5e-4)
+    n = num_nodes or 0
 
     for _ in range(epochs):
         model.train()
@@ -113,7 +152,18 @@ def fine_tune_svd_selective(model, ax, edge_index, train_pos_edge, train_neg_edg
         neg_label = torch.zeros(neg_score.shape[0], device=device)
         scores = torch.cat([pos_score, neg_score])
         labels = torch.cat([pos_label, neg_label])
-        loss = F.binary_cross_entropy_with_logits(scores, labels)
+        link_loss = F.binary_cross_entropy_with_logits(scores, labels)
+
+        # Structural regularization
+        reg_loss = torch.tensor(0.0, device=device)
+        if lambda_deg > 0:
+            reg_loss = reg_loss + lambda_deg * degree_distribution_loss(z, ei_d, n or z.shape[0])
+        if lambda_nbr > 0:
+            reg_loss = reg_loss + lambda_nbr * neighborhood_overlap_loss(z, ei_d)
+        if lambda_div > 0:
+            reg_loss = reg_loss + lambda_div * embedding_diversity_loss(z, ei_d, n or z.shape[0])
+
+        loss = link_loss + reg_loss
         loss.backward()
         # Mask gradients — only update important rows
         mask_gradients(model.lin1.weight, imp_W1)

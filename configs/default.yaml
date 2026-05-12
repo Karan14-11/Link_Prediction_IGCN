@@ -33,5 +33,8 @@ incremental:
 regularization:
   lambda_smooth: 0.1
   lambda_degree: 0.05
+  lambda_degree_dist: 0.05    # Degree distribution KL-div matching
+  lambda_neighborhood: 0.05   # Neighborhood overlap preservation
+  lambda_diversity: 0.02      # Embedding anti-collapse
 
 data_file: ../processed/askubuntu_compact.pt

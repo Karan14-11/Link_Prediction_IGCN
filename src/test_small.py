@@ -51,7 +51,7 @@ def test_baseline_gcn():
 
     # Eval
     metrics = eval_gcn_link(model, data, pos_edge, neg_edge)
-    print(f"  AUC={metrics['auc']:.4f}  AP={metrics['ap']:.4f}")
+    print(f"  HitRate={metrics.get('hit_rate', 0):.4f}  F1={metrics.get('f1', 0):.4f}  PosScore={metrics.get('pos_score', 0):.4f}  AUC={metrics['auc']:.4f}  AP={metrics['ap']:.4f}")
     print("  ✓ Baseline GCN works!\n")
 
 def test_incremental_gcn():
@@ -80,7 +80,7 @@ def test_incremental_gcn():
 
     # Eval
     metrics = eval_incremental_link(model, ax, data.edge_index, pos_edge, neg_edge)
-    print(f"  AUC={metrics['auc']:.4f}  AP={metrics['ap']:.4f}")
+    print(f"  HitRate={metrics.get('hit_rate', 0):.4f}  F1={metrics.get('f1', 0):.4f}  PosScore={metrics.get('pos_score', 0):.4f}  AUC={metrics['auc']:.4f}  AP={metrics['ap']:.4f}")
     print("  ✓ IncrementalGCN works!\n")
 
 def test_incremental_ax_update():
@@ -174,7 +174,7 @@ def test_cached_ax_finetune():
     model = fine_tune_incremental(model, ax, data.edge_index, pos_edge, neg_edge,
                                    epochs=5, lr=1e-3)
     metrics = eval_incremental_link(model, ax, data.edge_index, pos_edge, neg_edge)
-    print(f"  After fine-tune: AUC={metrics['auc']:.4f}  AP={metrics['ap']:.4f}")
+    print(f"  After fine-tune: HitRate={metrics.get('hit_rate', 0):.4f}  F1={metrics.get('f1', 0):.4f}  PosScore={metrics.get('pos_score', 0):.4f}  AUC={metrics['auc']:.4f}  AP={metrics['ap']:.4f}")
     print("  ✓ Cached-AX fine-tuning works!\n")
 
 if __name__ == '__main__':

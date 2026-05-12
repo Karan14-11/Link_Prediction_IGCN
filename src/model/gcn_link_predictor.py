@@ -52,7 +52,7 @@ def train_gcn_link(model, data, train_pos_edge, train_neg_edge, optimizer, devic
 
 @torch.no_grad()
 def eval_gcn_link(model, data, pos_edge, neg_edge, device='cpu'):
-    from sklearn.metrics import roc_auc_score, average_precision_score
+    from sklearn.metrics import roc_auc_score, average_precision_score, f1_score
     model.eval()
     x = data.x.to(device)
     edge_index = data.edge_index.to(device)
@@ -66,4 +66,20 @@ def eval_gcn_link(model, data, pos_edge, neg_edge, device='cpu'):
     ]).numpy()
     auc = roc_auc_score(labels, scores) if len(set(labels)) > 1 else 0.5
     ap = average_precision_score(labels, scores) if len(set(labels)) > 1 else 0.5
-    return {'auc': auc, 'ap': ap}
+    
+    pred_labels = (scores > 0.5).astype(int)
+    f1 = f1_score(labels, pred_labels) if len(set(labels)) > 1 else 0.0
+    
+    # Calculate how many of the new added edges were predicted correctly (> 0.5)
+    pos_probs = pos_score.sigmoid()
+    pos_correct = (pos_probs > 0.5).sum().item()
+    pos_total = pos_score.shape[0]
+    hit_rate = pos_correct / max(pos_total, 1)
+
+    return {
+        'auc': auc, 
+        'ap': ap, 
+        'f1': f1,
+        'pos_score': pos_probs.mean().item(),
+        'hit_rate': hit_rate
+    }

@@ -84,8 +84,14 @@ def run_experiment(config, args):
     feature_dim = config['model_gcn']['feature_dim']
     gcn_cfg    = config['model_gcn']
     inc_cfg    = config['incremental']
+    reg_cfg    = config.get('regularization', {})
     epochs     = args.epochs or config['training']['epochs']
     lr         = config['training']['lr']
+
+    # Regularization weights
+    lambda_deg = reg_cfg.get('lambda_degree_dist', 0.05)
+    lambda_nbr = reg_cfg.get('lambda_neighborhood', 0.05)
+    lambda_div = reg_cfg.get('lambda_diversity', 0.02)
 
     # ── 1. Build snapshots ─────────────────────────────────────────
     print("\n" + "=" * 60)
@@ -104,7 +110,7 @@ def run_experiment(config, args):
     # ── 2. Initial training on snapshot[num_train-1] ───────────────
     train_snap = snapshots[num_train - 1]
     train_snap.x = compute_node_features(train_snap, num_nodes, feature_dim)
-    train_snap.ax = compute_AX_sparse(train_snap.edge_index, num_nodes, train_snap.x)
+    train_snap.ax = compute_AX_sparse(train_snap.edge_index, num_nodes, train_snap.x, device=device)
 
     print("\n" + "=" * 60)
     print(f"STEP 2: Initial training (snapshot {num_train-1})")
@@ -195,7 +201,7 @@ def run_experiment(config, args):
 
         # ── Strategy 3: Inc-GCN No Update ──
         t0 = time.time()
-        snap_ax = compute_AX_sparse(snap.edge_index, num_nodes, snap.x)
+        snap_ax = compute_AX_sparse(snap.edge_index, num_nodes, snap.x, device=device)
         r = eval_incremental_link(inc_model, snap_ax, snap.edge_index,
                                    test_pos, test_neg, device)
         times['inc_no_update'].append(time.time() - t0)
@@ -203,15 +209,14 @@ def run_experiment(config, args):
 
         # ── Strategy 4: Cached AX ──
         t0 = time.time()
-        if 0 < len(affected) < num_nodes // 2:
-            adj, deg, ns, n2i = build_adj_structures(snap.edge_index, num_nodes)
-            rows = nodes_for_AX_update(adj, affected)
-            cached_ax = update_AX_rows(adj, deg, ns, n2i, snap.x.cpu(), prev_ax, rows)
-        else:
-            cached_ax = compute_AX_sparse(snap.edge_index, num_nodes, snap.x)
+        # Since compute_AX_sparse is highly optimized on GPU, it is much faster
+        # to recompute it fully than to use the Python-loop based update_AX_rows
+        # for any realistically large graph. We skip the loops entirely.
+        cached_ax = compute_AX_sparse(snap.edge_index, num_nodes, snap.x, device=device)
         m_c = copy.deepcopy(inc_cached)
         m_c = fine_tune_incremental(m_c, cached_ax, snap.edge_index,
-                                     ft_pos, ft_neg, ft_epochs, ft_lr, device)
+                                     ft_pos, ft_neg, ft_epochs, ft_lr, device,
+                                     num_nodes, lambda_deg, lambda_nbr, lambda_div)
         r = eval_incremental_link(m_c, cached_ax, snap.edge_index,
                                    test_pos, test_neg, device)
         times['inc_cached_ax'].append(time.time() - t0)
@@ -222,7 +227,7 @@ def run_experiment(config, args):
 
         # ── Strategy 5: Subgraph ──
         t0 = time.time()
-        sub_ax = compute_AX_sparse(snap.edge_index, num_nodes, snap.x)
+        sub_ax = compute_AX_sparse(snap.edge_index, num_nodes, snap.x, device=device)
         if len(affected) > 0:
             sub_nodes, sub_ei, _, g2l = build_k_hop_subgraph_from_edge_index(
                 snap.edge_index, affected, num_nodes, k=inc_cfg['k_hop']
@@ -243,7 +248,8 @@ def run_experiment(config, args):
 
         m_s = copy.deepcopy(inc_subgraph)
         m_s = fine_tune_incremental(m_s, sub_ax, snap.edge_index,
-                                     sub_ft_pos, sub_ft_neg, ft_epochs, ft_lr, device)
+                                     sub_ft_pos, sub_ft_neg, ft_epochs, ft_lr, device,
+                                     num_nodes, lambda_deg, lambda_nbr, lambda_div)
         r = eval_incremental_link(m_s, sub_ax, snap.edge_index,
                                    test_pos, test_neg, device)
         times['inc_subgraph'].append(time.time() - t0)
@@ -252,11 +258,12 @@ def run_experiment(config, args):
 
         # ── Strategy 6: SVD Selective ──
         t0 = time.time()
-        svd_ax = compute_AX_sparse(snap.edge_index, num_nodes, snap.x)
+        svd_ax = compute_AX_sparse(snap.edge_index, num_nodes, snap.x, device=device)
         m_v = copy.deepcopy(inc_svd_m)
         m_v = fine_tune_svd_selective(
             m_v, svd_ax, snap.edge_index, ft_pos, ft_neg,
-            ft_epochs, ft_lr, inc_cfg['svd_k'], inc_cfg['svd_top_k'], device
+            ft_epochs, ft_lr, inc_cfg['svd_k'], inc_cfg['svd_top_k'], device,
+            num_nodes, lambda_deg, lambda_nbr, lambda_div
         )
         r = eval_incremental_link(m_v, svd_ax, snap.edge_index,
                                    test_pos, test_neg, device)
@@ -273,12 +280,9 @@ def run_experiment(config, args):
         # Print snapshot summary
         tqdm.write(
             f"  Snap {snap_idx} | "
-            f"GCN-S:{results['gcn_static'][-1]['auc']:.4f} "
-            f"GCN-R:{results['gcn_retrain'][-1]['auc']:.4f} "
-            f"Inc-No:{results['inc_no_update'][-1]['auc']:.4f} "
-            f"Inc-AX:{results['inc_cached_ax'][-1]['auc']:.4f} "
-            f"Inc-Sub:{results['inc_subgraph'][-1]['auc']:.4f} "
-            f"Inc-SVD:{results['inc_svd'][-1]['auc']:.4f}"
+            f"GCN-R: {results['gcn_retrain'][-1]['f1']:.2f}f {results['gcn_retrain'][-1]['hit_rate']:.2f}h {results['gcn_retrain'][-1]['pos_score']:.2f}p {results['gcn_retrain'][-1]['auc']:.2f}a | "
+            f"Inc-Sub: {results['inc_subgraph'][-1]['f1']:.2f}f {results['inc_subgraph'][-1]['hit_rate']:.2f}h {results['inc_subgraph'][-1]['pos_score']:.2f}p {results['inc_subgraph'][-1]['auc']:.2f}a | "
+            f"Inc-SVD: {results['inc_svd'][-1]['f1']:.2f}f {results['inc_svd'][-1]['hit_rate']:.2f}h {results['inc_svd'][-1]['pos_score']:.2f}p {results['inc_svd'][-1]['auc']:.2f}a"
         )
 
     # ── 4. Summary ─────────────────────────────────────────────────
@@ -296,16 +300,22 @@ def run_experiment(config, args):
     }
 
     summary = {}
-    print(f"\n{'Strategy':<25s} {'Mean AUC':>10s} {'Std AUC':>10s} "
-          f"{'Mean AP':>10s} {'Std AP':>10s} {'Total Time':>12s} {'Avg Time':>10s}")
-    print("-" * 90)
+    print(f"\n{'Strategy':<25s} {'Mean F1':>10s} {'Mean HitRate':>15s} {'Mean PosScore':>15s} {'Mean AUC':>10s} "
+          f"{'Mean AP':>10s} {'Total Time':>12s} {'Avg Time':>10s}")
+    print("-" * 115)
 
     for s in STRATEGIES:
         aucs = [r['auc'] for r in results[s] if not np.isnan(r.get('auc', np.nan))]
         aps  = [r['ap']  for r in results[s] if not np.isnan(r.get('ap', np.nan))]
+        pos  = [r['pos_score'] for r in results[s] if not np.isnan(r.get('pos_score', np.nan))]
+        hits = [r['hit_rate'] for r in results[s] if not np.isnan(r.get('hit_rate', np.nan))]
+        f1s  = [r.get('f1', 0) for r in results[s] if not np.isnan(r.get('f1', np.nan))]
         tt = sum(times[s])
         at = np.mean(times[s]) if times[s] else 0
         summary[s] = {
+            'mean_f1':  float(np.mean(f1s))  if f1s else 0,
+            'mean_hit': float(np.mean(hits)) if hits else 0,
+            'mean_pos': float(np.mean(pos))  if pos else 0,
             'mean_auc': float(np.mean(aucs)) if aucs else 0,
             'std_auc':  float(np.std(aucs))  if aucs else 0,
             'mean_ap':  float(np.mean(aps))  if aps else 0,
@@ -314,8 +324,8 @@ def run_experiment(config, args):
             'avg_time': at,
         }
         d = summary[s]
-        print(f"  {LABELS[s]:<23s} {d['mean_auc']:10.4f} {d['std_auc']:10.4f} "
-              f"{d['mean_ap']:10.4f} {d['std_ap']:10.4f} {tt:10.2f}s {at:10.2f}s")
+        print(f"  {LABELS[s]:<23s} {d['mean_f1']:10.4f} {d['mean_hit']:15.4f} {d['mean_pos']:15.4f} {d['mean_auc']:10.4f} "
+              f"{d['mean_ap']:10.4f} {tt:10.2f}s {at:10.2f}s")
 
     # ── 5. Save ────────────────────────────────────────────────────
     output = {

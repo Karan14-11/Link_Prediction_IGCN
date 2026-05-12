@@ -81,22 +81,25 @@ def compute_AX_full(adjacency, deg, nodes_sorted, node_to_idx, X):
     return AX
 
 
-def compute_AX_sparse(edge_index, num_nodes, X):
+def compute_AX_sparse(edge_index, num_nodes, X, device=None):
     """
     Compute A_hat @ X using sparse matrix multiplication.
-    Much faster than row-wise for large graphs.
-
-    A_hat = D^{-1/2} (A + I) D^{-1/2}
+    Fully vectorized and runs on target device.
     """
+    if device is None:
+        device = X.device if torch.is_tensor(X) else torch.device('cpu')
+        
     if isinstance(X, np.ndarray):
-        X = torch.tensor(X, dtype=torch.float)
+        X = torch.tensor(X, dtype=torch.float, device=device)
     else:
-        X = X.clone().detach().cpu().float()
+        X = X.to(device).float()
+
+    edge_index = edge_index.to(device)
 
     # Add self-loops
-    self_loops = torch.arange(num_nodes, dtype=torch.long)
+    self_loops = torch.arange(num_nodes, dtype=torch.long, device=device)
     self_loop_idx = torch.stack([self_loops, self_loops], dim=0)
-    edge_index_sl = torch.cat([edge_index.cpu(), self_loop_idx], dim=1)
+    edge_index_sl = torch.cat([edge_index, self_loop_idx], dim=1)
 
     # Make undirected (if not already)
     edge_index_sl = torch.cat([edge_index_sl, edge_index_sl.flip(0)], dim=1)
@@ -104,8 +107,8 @@ def compute_AX_sparse(edge_index, num_nodes, X):
 
     # Compute degree
     row = edge_index_sl[0]
-    deg = torch.zeros(num_nodes)
-    ones = torch.ones(edge_index_sl.shape[1])
+    deg = torch.zeros(num_nodes, device=device)
+    ones = torch.ones(edge_index_sl.shape[1], device=device)
     deg.scatter_add_(0, row, ones)
 
     # D^{-1/2}
@@ -116,7 +119,7 @@ def compute_AX_sparse(edge_index, num_nodes, X):
     edge_weight = deg_inv_sqrt[edge_index_sl[0]] * deg_inv_sqrt[edge_index_sl[1]]
 
     # Sparse matmul
-    adj = torch.sparse_coo_tensor(edge_index_sl, edge_weight, (num_nodes, num_nodes))
+    adj = torch.sparse_coo_tensor(edge_index_sl, edge_weight, (num_nodes, num_nodes), device=device)
     AX = torch.sparse.mm(adj, X)
 
     return AX
@@ -289,33 +292,38 @@ def compare_svd(svd_old, svd_new, tag="comparison"):
 # Edge Diff Computation
 # =========================================================================
 
-def compute_edge_diff(old_edge_index, new_edge_index):
+def compute_edge_diff(old_edge_index, new_edge_index, num_nodes=None):
     """
     Compute added and removed edges between two snapshots.
-
-    Returns:
-        added_edges: list of (u, v) tuples
-        removed_edges: list of (u, v) tuples
-        affected_nodes: set of nodes involved in changes
+    Vectorized using 1D integer hashing for extreme speed.
     """
-    # Convert to sets of tuples for comparison
-    def edge_set(ei):
-        if ei.shape[1] == 0:
-            return set()
-        return set(zip(ei[0].tolist(), ei[1].tolist()))
+    if num_nodes is None:
+        num_nodes = max(
+            old_edge_index.max().item() if old_edge_index.numel() > 0 else 0,
+            new_edge_index.max().item() if new_edge_index.numel() > 0 else 0
+        ) + 1
 
-    old_set = edge_set(old_edge_index)
-    new_set = edge_set(new_edge_index)
+    device = old_edge_index.device
+    new_edge_index = new_edge_index.to(device)
 
-    added = new_set - old_set
-    removed = old_set - new_set
+    old_hash = old_edge_index[0] * num_nodes + old_edge_index[1]
+    new_hash = new_edge_index[0] * num_nodes + new_edge_index[1]
 
-    added_edges = list(added)
-    removed_edges = list(removed)
+    # Added edges
+    added_mask = ~torch.isin(new_hash, old_hash)
+    added_edges_tensor = new_edge_index[:, added_mask]
+    added_edges = added_edges_tensor.t().tolist()
 
+    # Removed edges
+    removed_mask = ~torch.isin(old_hash, new_hash)
+    removed_edges_tensor = old_edge_index[:, removed_mask]
+    removed_edges = removed_edges_tensor.t().tolist()
+
+    # Affected nodes
     affected_nodes = set()
-    for u, v in added_edges + removed_edges:
-        affected_nodes.add(u)
-        affected_nodes.add(v)
+    if added_edges_tensor.numel() > 0:
+        affected_nodes.update(added_edges_tensor.flatten().tolist())
+    if removed_edges_tensor.numel() > 0:
+        affected_nodes.update(removed_edges_tensor.flatten().tolist())
 
     return added_edges, removed_edges, affected_nodes
